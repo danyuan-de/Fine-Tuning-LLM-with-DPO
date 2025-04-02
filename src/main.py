@@ -8,7 +8,6 @@ import os
 import json
 import torch
 from torch.utils.data import DataLoader
-# from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import AutoTokenizer, AutoModelForCausalLM, PretrainedConfig
 from functools import partial
@@ -16,7 +15,7 @@ import copy
 import time
 from datetime import timedelta
 import numpy as np
-import multiprocessing
+import random
 
 import src.config as config
 from src.dpoLoss import DPOLoss
@@ -25,37 +24,38 @@ from src.utility import *
 from src.trainer import train_model_dpo_simple
 
 # --------- File Paths ---------
+model_workspace_dir = config.model_workspace_dir # directory to save the fine-tuned model
+cache_dir = config.cache_dir # cache directory for the Hugging Face model
+result_dir = config.result_dir # directory to save the output text and figures
 model_name = config.model_name
-cache_dir = config.cache_dir
-file_path = config.file_mixed
+file_path = config.file_content
 
 # --------- Hyperparameters ---------
 allowed_max_length = config.allowed_max_length
 max_new_tokens = config.max_new_tokens
 batch_size = config.batch_size
+gradient_accumulation_steps = config.gradient_accumulation_steps
 num_epochs = config.num_epochs
-beta = config.beta
 learning_rate = config.learning_rate
+weight_decay = config.weight_decay
 temperature = config.temperature
 top_p = config.top_p
-dpo_loss_fn = DPOLoss(beta=beta)
+dpo_loss_fn = DPOLoss(beta=config.beta)
+print(f"Using DPOP with beta={config.beta}")
 
 # --------- Device ---------
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 print(f"Device: {device}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"CUDA Version: {torch.version.cuda}")
 
 # --------- Load a Hugging Face model and tokenizer ---------
 tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
 model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir, torch_dtype=torch.bfloat16)
 
-# Add the EOT token to the tokenizer
-eot_token_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
-
-special_tokens = {
-    "additional_special_tokens": ["<|eot_id|>"]
-}
-tokenizer.add_special_tokens(special_tokens)
-model.resize_token_embeddings(len(tokenizer)) # adjust the size of the token embeddings
+# Get the end of text token ID
+eot_token_id = tokenizer.eos_token_id  # Instead of tokenizer.convert_tokens_to_ids(eot_token)
 
 policy_model = model # this is the model that will be fine-tuned
 ref_model = copy.deepcopy(model) # create a reference model for DPO by copying and freezing the parameters
@@ -71,15 +71,8 @@ ref_model.to(device)
 
 # Ensure pad_token is defined
 if tokenizer.pad_token is None:
-    if tokenizer.eos_token:
-        tokenizer.pad_token = tokenizer.eos_token
-    else:
-        tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-        model.resize_token_embeddings(len(tokenizer))
-        ref_model.resize_token_embeddings(len(tokenizer))
-
-# model.config.pad_token_id = tokenizer.pad_token_id
-# ref_model.config.pad_token_id = tokenizer.pad_token_id
+    tokenizer.pad_token = tokenizer.eos_token
+    print(f"Using EOS token '{tokenizer.pad_token}' as PAD token")
 
 print("Model and tokenizer loaded.")
 
@@ -91,9 +84,12 @@ print("Number of entries:", len(data))
 
 # Need to use 5-fold cross-validation or more
 # Train/val/test split
-train_portion = int(len(data) * 0.70)
-test_portion = int(len(data) * 0.15) 
+train_portion = int(len(data) * 0.8)
+test_portion = int(len(data) * 0.1) 
 val_portion = len(data) - train_portion - test_portion
+
+# Shuffle the data
+random.shuffle(data)
 
 print("Train portion:", train_portion)
 print("Validation portion:", val_portion)
@@ -156,7 +152,7 @@ stopping_criteria = StoppingCriteriaList([
 ])
 
 optimizer = torch.optim.AdamW(policy_model.parameters(), lr=learning_rate, weight_decay=0.01)
-scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs * len(train_loader), eta_min=1e-6)
+# scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs * len(train_loader), eta_min=1e-6)
 
 # Before training loop. If chosen and rejected responses are too similar, the preference margin won’t grow.
 batch = next(iter(train_loader))
@@ -178,6 +174,8 @@ print("Validation loss:", res["val_loss"])
 print("Train reward margin:", res["train_chosen_reward"] - res["train_rejected_reward"])
 print("Val reward margin:", res["val_chosen_reward"] - res["val_rejected_reward"])
 
+print("Starting training...")
+
 start_time = time.time()
 
 torch.manual_seed(123) # For reproducibility due to the shuffling in the data loader
@@ -185,25 +183,37 @@ torch.manual_seed(123) # For reproducibility due to the shuffling in the data lo
 tracking = train_model_dpo_simple(
     dpo_loss_fn=dpo_loss_fn,
     optimizer=optimizer,
-    scheduler=scheduler,
+    scheduler=None,
     policy_model=policy_model,
     reference_model=ref_model,
     train_loader=train_loader,
     val_loader=val_loader,
     num_epochs=num_epochs,
-    eval_freq=5,
+    eval_freq=config.eval_freq,
     eval_iter=5,
+    gradient_accumulation_steps=gradient_accumulation_steps
 )
 
 end_time = time.time()
 execution_time_minutes = (end_time - start_time) / 60
 print(f"Training completed in {execution_time_minutes:.2f} minutes (in {str(timedelta(seconds=end_time - start_time))})")
 
+print("Final train/validation statistics:")
+print(f"Train loss: {tracking['train_losses'][-1]}")
+print(f"Validation loss: {tracking['val_losses'][-1]}")
+train_margin = tracking['train_chosen_rewards'][-1] - tracking['train_rejected_rewards'][-1]
+val_margin = tracking['val_chosen_rewards'][-1] - tracking['val_rejected_rewards'][-1]
+print(f"Train reward margin: {train_margin:.3f}")
+print(f"Validation reward margin: {val_margin:.3f}")
+
 # Save the model and tokenizer
 save_path = config.fine_tuned_model_path
 policy_model.save_pretrained(save_path)
 tokenizer.save_pretrained(save_path)
 print(f"Model and tokenizer saved to {save_path}")
+
+# Ensure result directory exists
+os.makedirs(config.result_dir, exist_ok=True)
 
 # Plot the losses
 epochs_tensor = torch.linspace(0, num_epochs, len(tracking["train_losses"]))
@@ -258,7 +268,8 @@ for i, entry in enumerate(val_data[:3]):
         max_new_tokens=max_new_tokens,
         # temperature=temperature,
         # top_p=top_p,
-        stopping_criteria=stopping_criteria
+        stopping_criteria=stopping_criteria,
+        eot_token_id=eot_token_id
     )
     ref_full_text = tokenizer.decode(ref_generated[0], skip_special_tokens=False)
     ref_response = postprocess_response(ref_full_text)
@@ -271,7 +282,8 @@ for i, entry in enumerate(val_data[:3]):
         max_new_tokens=max_new_tokens,
         # temperature=temperature,
         # top_p=top_p,
-        stopping_criteria=stopping_criteria
+        stopping_criteria=stopping_criteria,
+        eot_token_id=eot_token_id
     )
     fine_tuned_model_full_text = fine_tuned_tokenizer.decode(fine_tuned_model_generated[0], skip_special_tokens=False)
     fine_tuned_model_response = postprocess_response(fine_tuned_model_full_text)
@@ -311,7 +323,7 @@ test_res = dpo_loss_fn.evaluate_dpo_loss_loader(
 print("Test loss:", test_res["val_loss"])
 print("Test reward margin:", test_res["val_chosen_reward"] - test_res["val_rejected_reward"])
 
-for i, entry in enumerate(test_data[:train_portion//2]):
+for i, entry in enumerate(random.sample(test_data[:5], len(test_data[:5]))):
     input_text = format_input(entry)
 
     # Reference Model Generation
@@ -322,7 +334,8 @@ for i, entry in enumerate(test_data[:train_portion//2]):
         max_new_tokens=max_new_tokens,
         # temperature=temperature,
         # top_p=top_p,
-        stopping_criteria=stopping_criteria
+        stopping_criteria=stopping_criteria,
+        eot_token_id=eot_token_id
     )
     ref_full_text = tokenizer.decode(ref_generated[0], skip_special_tokens=False)
     ref_response = postprocess_response(ref_full_text)
@@ -335,7 +348,8 @@ for i, entry in enumerate(test_data[:train_portion//2]):
         max_new_tokens=max_new_tokens,
         # temperature=temperature,
         # top_p=top_p,
-        stopping_criteria=stopping_criteria
+        stopping_criteria=stopping_criteria,
+        eot_token_id=eot_token_id
     )
     fine_tuned_model_full_text = fine_tuned_tokenizer.decode(fine_tuned_model_generated[0], skip_special_tokens=False)
     fine_tuned_model_response = postprocess_response(fine_tuned_model_full_text)
@@ -351,7 +365,7 @@ for i, entry in enumerate(test_data[:train_portion//2]):
     print(f"Expected Answer: {entry['chosen']}")
     print("="*80, "\n")
 
-    with open(config.output_text, "a") as f:
+    with open(os.path.join(result_dir, "output_test.txt"), "a") as f:
         f.write(f"\nInput{i}: {entry['question']}")
         f.write("\n ----- Reference Model ----- ")
         f.write(f"Reference Response: {ref_response}")
