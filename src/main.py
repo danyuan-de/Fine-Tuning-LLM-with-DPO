@@ -1,6 +1,6 @@
 # Description: This script trains a model using DPO on the instruction data with preferences.
 # Execute: PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 python -m src.main.py for MPS (MacOS)
-# Execute: python -m src.main.py for CUDA (Linux)
+# Execute: python -m src.main for CUDA (Linux)
 # Update pytorch: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/mps
 
 
@@ -29,6 +29,7 @@ cache_dir = config.cache_dir # cache directory for the Hugging Face model
 result_dir = config.result_dir # directory to save the output text and figures
 model_name = config.model_name
 file_path = config.file_content
+dpo_output_txt = config.dpo_output_txt
 
 # --------- Hyperparameters ---------
 allowed_max_length = config.allowed_max_length
@@ -88,12 +89,12 @@ train_portion = int(len(data) * 0.8)
 test_portion = int(len(data) * 0.1) 
 val_portion = len(data) - train_portion - test_portion
 
-# Shuffle the data
-random.shuffle(data)
-
 print("Train portion:", train_portion)
 print("Validation portion:", val_portion)
 print("Test portion:", test_portion)
+
+# Shuffle the data
+random.shuffle(data)
 
 train_data = data[:train_portion]
 test_data = data[train_portion:train_portion + test_portion]
@@ -138,13 +139,13 @@ test_loader = DataLoader(
     drop_last=False,
 )
 
-print("Train loader:")
-for batch in train_loader:
-    print(
-        batch["chosen"].shape,
-        batch["rejected"].shape,
-    )
-print("\n")
+# print("Train loader:")
+# for batch in train_loader:
+#     print(
+#         batch["chosen"].shape,
+#         batch["rejected"].shape,
+#     )
+# print("\n")
 
 # self-defined stopping criteria
 stopping_criteria = StoppingCriteriaList([
@@ -174,7 +175,9 @@ print("Validation loss:", res["val_loss"])
 print("Train reward margin:", res["train_chosen_reward"] - res["train_rejected_reward"])
 print("Val reward margin:", res["val_chosen_reward"] - res["val_rejected_reward"])
 
+print("\n" + "=" * 50)
 print("Starting training...")
+print("=" * 50)
 
 start_time = time.time()
 
@@ -292,7 +295,12 @@ for i, entry in enumerate(val_data[:3]):
     # ft_perplexity = calculate_perplexity(fine_tuned_model, fine_tuned_tokenizer, input_text)
     # ref_perplexity = calculate_perplexity(ref_model, tokenizer, input_text)
 
-    print(f"\nInput{i}: {entry['question']}")
+    if ('question' in entry):
+        print(f"\nInput{i}: {entry['question']}")
+    elif ('instruction' in entry):
+        print(f"\nInput{i}: {entry['instruction']}")
+    else:
+        print(f"\nInput{i}: [No valid input key found]")
 
     print("\n ----- Reference Model ----- ")
     print(f"Reference Response: {ref_response}")
@@ -354,7 +362,13 @@ for i, entry in enumerate(random.sample(test_data[:5], len(test_data[:5]))):
     fine_tuned_model_full_text = fine_tuned_tokenizer.decode(fine_tuned_model_generated[0], skip_special_tokens=False)
     fine_tuned_model_response = postprocess_response(fine_tuned_model_full_text)
 
-    print(f"\nInput{i}: {entry['question']}")
+    if ('question' in entry):
+        print(f"\nInput{i}: {entry['question']}")
+    elif ('instruction' in entry):
+        print(f"\nInput{i}: {entry['instruction']}")
+    else:
+        print(f"\nInput{i}: [No valid input key found]")
+
     print("\n ----- Reference Model ----- ")
     print(f"Reference Response: {ref_response}")
 
@@ -365,8 +379,13 @@ for i, entry in enumerate(random.sample(test_data[:5], len(test_data[:5]))):
     print(f"Expected Answer: {entry['chosen']}")
     print("="*80, "\n")
 
-    with open(os.path.join(result_dir, "output_test.txt"), "a") as f:
-        f.write(f"\nInput{i}: {entry['question']}")
+    with open(dpo_output_txt, "a") as f:
+        if ('question' in entry):
+            f.write(f"\nInput{i}: {entry['question']}")
+        elif ('instruction' in entry):
+            f.write(f"\nInput{i}: {entry['instruction']}")
+        else:
+            f.write(f"\nInput{i}: [No valid input key found]")
         f.write("\n ----- Reference Model ----- ")
         f.write(f"Reference Response: {ref_response}")
         f.write("\n ----- Policy Model ----- ")

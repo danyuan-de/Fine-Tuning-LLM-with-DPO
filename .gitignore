@@ -33,7 +33,7 @@ test.py
 
 wandb/
 Llama-*/
-Result_loss/
+workspace/
 
 # data files
 # instruction-data-with-preference.json
